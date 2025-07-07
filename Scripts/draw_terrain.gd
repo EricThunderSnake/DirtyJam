@@ -1,6 +1,8 @@
 @tool
 class_name DrawTerrainMesh extends CompositorEffect
 
+var final_vertex: String
+var final_fragment: String
 
 ## Regenerate mesh data and recompile shaders TODO: Separate mesh generation and shader recompilation
 @export var regenerate : bool = true
@@ -100,15 +102,23 @@ func _init():
 	effect_callback_type = CompositorEffect.EFFECT_CALLBACK_TYPE_POST_TRANSPARENT
 	
 	rd = RenderingServer.get_rendering_device()
-
+	
+	var shader_include = load_include()
+	
+	final_vertex = shader_include + source_vertex
+	final_fragment = shader_include + source_fragment
+	
 	# Gets whatever light source is in the scene, compositor effects are resources not nodes and so we need to do some jank stuff to get access to the node scene tree
 	var tree := Engine.get_main_loop() as SceneTree
 	var root : Node = tree.edited_scene_root if Engine.is_editor_hint() else tree.current_scene
 	if root: light = root.get_node_or_null('DirectionalLight3D')
 
+
 # Compiles... the shader...?
 func compile_shader(vertex_shader : String, fragment_shader : String) -> RID:
 	var src := RDShaderSource.new()
+	
+	
 	src.source_vertex = vertex_shader
 	src.source_fragment = fragment_shader
 	
@@ -124,8 +134,8 @@ func compile_shader(vertex_shader : String, fragment_shader : String) -> RID:
 	return shader
 
 func initialize_render(framebuffer_format : int):
-	p_shader = compile_shader(source_vertex, source_fragment)
-	p_wire_shader = compile_shader(source_vertex, source_wire_fragment)
+	p_shader = compile_shader(final_vertex, final_fragment)
+	p_wire_shader = compile_shader(final_vertex, source_wire_fragment)
 
 	var vertex_buffer := PackedFloat32Array([])
 	var half_length = (side_length - 1) / 2.0
@@ -401,36 +411,12 @@ func _notification(what):
 		if p_wire_index_buffer.is_valid():
 			rd.free_rid(p_wire_index_buffer)
 
+func load_include():
+	var content = FileAccess.get_file_as_string("res://Includes/shader_context.gdshaderinc")
+	return content
 
 
 const source_vertex = "
-		#version 450
-
-		// This is the uniform buffer that contains all of the settings we sent over from the cpu in _render_callback. Must match with the one in the fragment shader.
-		layout(set = 0, binding = 0, std140) uniform UniformBufferObject {
-			mat4 MVP;
-			vec3 _LightDirection;
-			float _GradientRotation;
-			float _NoiseRotation;
-			float _TerrainHeight;
-			vec2 _AngularVariance;
-			float _Scale;
-			float _Octaves;
-			float _AmplitudeDecay;
-			float _NormalStrength;
-			vec3 _Offset;
-			float _Seed;
-			float _InitialAmplitude;
-			float _Lacunarity;
-			vec2 _SlopeRange;
-			vec4 _LowSlopeColor;
-			vec4 _HighSlopeColor;
-			float _FrequencyVarianceLowerBound;
-			float _FrequencyVarianceUpperBound;
-			float _SlopeDamping;
-			vec4 _AmbientLight;
-		};
-		
 		// This is the vertex data layout that we defined in initialize_render after line 198
 		layout(location = 0) in vec3 a_Position;
 		layout(location = 1) in vec4 a_Color;
@@ -438,139 +424,6 @@ const source_vertex = "
 		// This is what the vertex shader will output and send to the fragment shader.
 		layout(location = 2) out vec4 v_Color;
 		layout(location = 3) out vec3 pos;
-
-		#define PI 3.141592653589793238462
-		
-		// UE4's PseudoRandom function
-		// https://github.com/EpicGames/UnrealEngine/blob/release/Engine/Shaders/Private/Random.ush
-		float pseudo(vec2 v) {
-			v = fract(v/128.)*128. + vec2(-64.340622, -72.465622);
-			return fract(dot(v.xyx * v.xyy, vec3(20.390625, 60.703125, 2.4281209)));
-		}
-
-		// Takes our xz positions and turns them into a random number between 0 and 1 using the above pseudo random function
-		float HashPosition(vec2 pos) {
-			return pseudo(pos * vec2(_Seed, _Seed + 4));
-		}
-
-		// Generates a random gradient vector for the perlin noise lattice points, watch my perlin noise video for a more in depth explanation
-		vec2 RandVector(float seed) {
-			float theta = seed * 360 * 2 - 360;
-			theta += _GradientRotation;
-			theta = theta * PI / 180.0;
-			return normalize(vec2(cos(theta), sin(theta)));
-		}
-
-		// Normal smoothstep is cubic -- to avoid discontinuities in the gradient, we use a quintic interpolation instead as explained in my perlin noise video
-		vec2 quinticInterpolation(vec2 t) {
-			return t * t * t * (t * (t * vec2(6) - vec2(15)) + vec2(10));
-		}
-
-		// Derivative of above function
-		vec2 quinticDerivative(vec2 t) {
-			return vec2(30) * t * t * (t * (t - vec2(2)) + vec2(1));
-		}
-
-		// it's perlin noise that returns the noise in the x component and the derivatives in the yz components as explained in my perlin noise video
-		vec3 perlin_noise2D(vec2 pos) {
-			vec2 latticeMin = floor(pos);
-			vec2 latticeMax = ceil(pos);
-
-			vec2 remainder = fract(pos);
-
-			// Lattice Corners
-			vec2 c00 = latticeMin;
-			vec2 c10 = vec2(latticeMax.x, latticeMin.y);
-			vec2 c01 = vec2(latticeMin.x, latticeMax.y);
-			vec2 c11 = latticeMax;
-
-			// Gradient Vectors assigned to each corner
-			vec2 g00 = RandVector(HashPosition(c00));
-			vec2 g10 = RandVector(HashPosition(c10));
-			vec2 g01 = RandVector(HashPosition(c01));
-			vec2 g11 = RandVector(HashPosition(c11));
-
-			// Directions to position from lattice corners
-			vec2 p0 = remainder;
-			vec2 p1 = p0 - vec2(1.0);
-
-			vec2 p00 = p0;
-			vec2 p10 = vec2(p1.x, p0.y);
-			vec2 p01 = vec2(p0.x, p1.y);
-			vec2 p11 = p1;
-			
-			vec2 u = quinticInterpolation(remainder);
-			vec2 du = quinticDerivative(remainder);
-
-			float a = dot(g00, p00);
-			float b = dot(g10, p10);
-			float c = dot(g01, p01);
-			float d = dot(g11, p11);
-
-			// Expanded interpolation freaks of nature from https://iquilezles.org/articles/gradientnoise/
-			float noise = a + u.x * (b - a) + u.y * (c - a) + u.x * u.y * (a - b - c + d);
-
-			vec2 gradient = g00 + u.x * (g10 - g00) + u.y * (g01 - g00) + u.x * u.y * (g00 - g10 - g01 + g11) + du * (u.yx * (a - b - c + d) + vec2(b, c) - a);
-			return vec3(noise, gradient);
-		}
-
-		// The fractional brownian motion that sums many noise values as explained in the video accompanying this project
-		vec3 fbm(vec2 pos) {
-			float lacunarity = _Lacunarity;
-			float amplitude = _InitialAmplitude;
-
-			// height sum
-			float height = 0.0;
-
-			// derivative sum
-			vec2 grad = vec2(0.0);
-
-			// accumulated rotations
-			mat2 m = mat2(1.0, 0.0,
-						  0.0, 1.0);
-
-			// generate random angle variance if applicable
-			float angle_variance = mix(_AngularVariance.x, _AngularVariance.y, HashPosition(vec2(_Seed, 827)));
-			float theta = (_NoiseRotation + angle_variance) * PI / 180.0;
-
-			// rotation matrix
-			mat2 m2 = mat2(cos(theta), -sin(theta),
-					  	   sin(theta),  cos(theta));
-				
-			mat2 m2i = inverse(m2);
-
-			for(int i = 0; i < int(_Octaves); ++i) {
-				vec3 n = perlin_noise2D(pos);
-				
-				// add height scaled by current amplitude
-				height += amplitude * n.x;	
-				
-				// add gradient scaled by amplitude and transformed by accumulated rotations
-				grad += amplitude * m * n.yz;
-				
-				// apply amplitude decay to reduce impact of next noise layer
-				amplitude *= _AmplitudeDecay;
-				
-				// generate random angle variance if applicable
-				angle_variance = mix(_AngularVariance.x, _AngularVariance.y, HashPosition(vec2(i * 419, _Seed)));
-				theta = (_NoiseRotation + angle_variance) * PI / 180.0;
-
-				// reconstruct rotation matrix, kind of a performance stink since this is technically expensive and doesn't need to be done if no random angle variance but whatever it's 2025
-				m2 = mat2(cos(theta), -sin(theta),
-					  	  sin(theta),  cos(theta));
-				
-				m2i = inverse(m2);
-
-				// generate frequency variance if applicable
-				float freq_variance = mix(_FrequencyVarianceLowerBound, _FrequencyVarianceUpperBound, HashPosition(vec2(i * 422, _Seed)));
-
-				// apply frequency adjustment to sample position for next noise layer
-				pos = (lacunarity + freq_variance) * m2 * pos;
-				m = (lacunarity + freq_variance) * m2i * m;
-			}
-
-			return vec3(height, grad);
-		}
 		
 		void main() {
 			// Passes the vertex color over to the fragment shader, even though we don't use it but you can use it if you want I guess
@@ -595,33 +448,6 @@ const source_vertex = "
 
 
 const source_fragment = "
-		#version 450
-
-		// This is the uniform buffer that contains all of the settings we sent over from the cpu in _render_callback. Must match with the one in the vertex shader, they're technically the same thing occupying the same spot in memory this is just duplicate code required for compilation.
-		layout(set = 0, binding = 0, std140) uniform UniformBufferObject {
-			mat4 MVP;
-			vec3 _LightDirection;
-			float _GradientRotation;
-			float _NoiseRotation;
-			float _TerrainHeight;
-			vec2 _AngularVariance;
-			float _Scale;
-			float _Octaves;
-			float _AmplitudeDecay;
-			float _NormalStrength;
-			vec3 _Offset;
-			float _Seed;
-			float _InitialAmplitude;
-			float _Lacunarity;
-			vec2 _SlopeRange;
-			vec4 _LowSlopeColor;
-			vec4 _HighSlopeColor;
-			float _FrequencyVarianceLowerBound;
-			float _FrequencyVarianceUpperBound;
-			float _SlopeDamping;
-			vec4 _AmbientLight;
-		};
-		
 		// These are the variables that we expect to receive from the vertex shader
 		layout(location = 2) in vec4 a_Color;
 		layout(location = 3) in vec3 pos;
@@ -629,139 +455,6 @@ const source_fragment = "
 		// This is what the fragment shader will output, usually just a pixel color
 		layout(location = 0) out vec4 frag_color;
 
-		#define PI 3.141592653589793238462
-		
-		// UE4's PseudoRandom function
-		// https://github.com/EpicGames/UnrealEngine/blob/release/Engine/Shaders/Private/Random.ush
-		float pseudo(vec2 v) {
-			v = fract(v/128.)*128. + vec2(-64.340622, -72.465622);
-			return fract(dot(v.xyx * v.xyy, vec3(20.390625, 60.703125, 2.4281209)));
-		}
-
-		// Takes our xz positions and turns them into a random number between 0 and 1 using the above pseudo random function
-		float HashPosition(vec2 pos) {
-			return pseudo(pos * vec2(_Seed, _Seed + 4));
-		}
-
-		// Generates a random gradient vector for the perlin noise lattice points, watch my perlin noise video for a more in depth explanation
-		vec2 RandVector(float seed) {
-			float theta = seed * 360 * 2 - 360;
-			theta += _GradientRotation;
-			theta = theta * PI / 180.0;
-			return normalize(vec2(cos(theta), sin(theta)));
-		}
-
-		// Normal smoothstep is cubic -- to avoid discontinuities in the gradient, we use a quintic interpolation instead as explained in my perlin noise video
-		vec2 quinticInterpolation(vec2 t) {
-			return t * t * t * (t * (t * vec2(6) - vec2(15)) + vec2(10));
-		}
-
-		// Derivative of above function
-		vec2 quinticDerivative(vec2 t) {
-			return vec2(30) * t * t * (t * (t - vec2(2)) + vec2(1));
-		}
-
-		// it's perlin noise that returns the noise in the x component and the derivatives in the yz components as explained in my perlin noise video
-		vec3 perlin_noise2D(vec2 pos) {
-			vec2 latticeMin = floor(pos);
-			vec2 latticeMax = ceil(pos);
-
-			vec2 remainder = fract(pos);
-
-			// Lattice Corners
-			vec2 c00 = latticeMin;
-			vec2 c10 = vec2(latticeMax.x, latticeMin.y);
-			vec2 c01 = vec2(latticeMin.x, latticeMax.y);
-			vec2 c11 = latticeMax;
-
-			// Gradient Vectors assigned to each corner
-			vec2 g00 = RandVector(HashPosition(c00));
-			vec2 g10 = RandVector(HashPosition(c10));
-			vec2 g01 = RandVector(HashPosition(c01));
-			vec2 g11 = RandVector(HashPosition(c11));
-
-			// Directions to position from lattice corners
-			vec2 p0 = remainder;
-			vec2 p1 = p0 - vec2(1.0);
-
-			vec2 p00 = p0;
-			vec2 p10 = vec2(p1.x, p0.y);
-			vec2 p01 = vec2(p0.x, p1.y);
-			vec2 p11 = p1;
-			
-			vec2 u = quinticInterpolation(remainder);
-			vec2 du = quinticDerivative(remainder);
-
-			float a = dot(g00, p00);
-			float b = dot(g10, p10);
-			float c = dot(g01, p01);
-			float d = dot(g11, p11);
-
-			// Expanded interpolation freaks of nature from https://iquilezles.org/articles/gradientnoise/
-			float noise = a + u.x * (b - a) + u.y * (c - a) + u.x * u.y * (a - b - c + d);
-
-			vec2 gradient = g00 + u.x * (g10 - g00) + u.y * (g01 - g00) + u.x * u.y * (g00 - g10 - g01 + g11) + du * (u.yx * (a - b - c + d) + vec2(b, c) - a);
-			return vec3(noise, gradient);
-		}
-
-		// The fractional brownian motion that sums many noise values as explained in the video accompanying this project
-		vec3 fbm(vec2 pos) {
-			float lacunarity = _Lacunarity;
-			float amplitude = _InitialAmplitude;
-
-			// height sum
-			float height = 0.0;
-
-			// derivative sum
-			vec2 grad = vec2(0.0);
-
-			// accumulated rotations
-			mat2 m = mat2(1.0, 0.0,
-						  0.0, 1.0);
-
-			// generate random angle variance if applicable
-			float angle_variance = mix(_AngularVariance.x, _AngularVariance.y, HashPosition(vec2(_Seed, 827)));
-			float theta = (_NoiseRotation + angle_variance) * PI / 180.0;
-
-			// rotation matrix
-			mat2 m2 = mat2(cos(theta), -sin(theta),
-					  	   sin(theta),  cos(theta));
-				
-			mat2 m2i = inverse(m2);
-
-			for(int i = 0; i < int(_Octaves); ++i) {
-				vec3 n = perlin_noise2D(pos);
-				
-				// add height scaled by current amplitude
-				height += amplitude * n.x;	
-				
-				// add gradient scaled by amplitude and transformed by accumulated rotations
-				grad += amplitude * m * n.yz;
-				
-				// apply amplitude decay to reduce impact of next noise layer
-				amplitude *= _AmplitudeDecay;
-				
-				// generate random angle variance if applicable
-				angle_variance = mix(_AngularVariance.x, _AngularVariance.y, HashPosition(vec2(i * 419, _Seed)));
-				theta = (_NoiseRotation + angle_variance) * PI / 180.0;
-
-				// reconstruct rotation matrix, kind of a performance stink since this is technically expensive and doesn't need to be done if no random angle variance but whatever it's 2025
-				m2 = mat2(cos(theta), -sin(theta),
-					  	  sin(theta),  cos(theta));
-				
-				m2i = inverse(m2);
-
-				// generate frequency variance if applicable
-				float freq_variance = mix(_FrequencyVarianceLowerBound, _FrequencyVarianceUpperBound, HashPosition(vec2(i * 422, _Seed)));
-
-				// apply frequency adjustment to sample position for next noise layer
-				pos = (lacunarity + freq_variance) * m2 * pos;
-				m = (lacunarity + freq_variance) * m2i * m;
-			}
-
-			return vec3(height, grad);
-		}
-		
 		void main() {
 			// Recalculate initial noise sampling position same as vertex shader
 			vec3 noise_pos = (pos + vec3(_Offset.x, 0, _Offset.z)) / _Scale;
